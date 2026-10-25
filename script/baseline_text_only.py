@@ -18,6 +18,8 @@ Contoh:
         --cats "Parks,Campgrounds,Beaches" --city Boise --state ID \
         --queries queries.csv --outdir out_text
 
+    Multi-metro: --state IN,FL,LA (beberapa state sekaligus; satu state Yelp ~ satu metro).
+    Tambahkan kolom `state` di queries.csv (mis. TN) supaya tiap query hanya mencari di metronya.
     Tanpa --cats = korpus satu kota penuh (semua kategori), lebih realistis untuk query bebas.
     --dense none           lewati dense (BM25 saja, tanpa GPU)
     --review-cache f.jsonl simpan subset review supaya run berikutnya tidak baca 5 GB lagi
@@ -62,8 +64,9 @@ def select_pois(business_path, cats, city, state, min_reviews):
         df = df[df["categories"].map(lambda s: any(c.strip().lower() in wanted for c in s.split(",")))]
     if city:
         df = df[df["city"].str.lower() == city.lower()]
-    if state:
-        df = df[df["state"].str.lower() == state.lower()]
+    if state:  # boleh beberapa state dipisah koma, mis. "IN,FL,LA"
+        states = {x.strip().lower() for x in state.split(",") if x.strip()}
+        df = df[df["state"].str.lower().isin(states)]
     df = df[df["review_count"] >= min_reviews].reset_index(drop=True)
     return df[["business_id", "name", "city", "state", "categories", "review_count",
                "latitude", "longitude"]]
@@ -71,8 +74,14 @@ def select_pois(business_path, cats, city, state, min_reviews):
 
 def load_reviews(reviews_path, ids, cache):
     if cache and os.path.exists(cache):
-        print(f"Pakai cache review: {cache}")
-        return read_jsonl(cache)
+        cached = read_jsonl(cache)
+        cached = cached[cached["business_id"].isin(ids)]
+        covered = cached["business_id"].nunique() / max(len(ids), 1)
+        if covered >= 0.8:  # cache cukup mewakili POI yang diminta
+            print(f"Pakai cache review: {cache} (mencakup {covered:.0%} POI)")
+            return cached.reset_index(drop=True)
+        print(f"Cache {cache} hanya mencakup {covered:.0%} POI yang diminta "
+              f"(kemungkinan dibuat untuk scope lain). Baca ulang review.json dan timpa cache.")
     parts = []
     for ch in read_jsonl(reviews_path, chunksize=200_000):
         ch = ch[ch["business_id"].isin(ids)][["business_id", "review_id", "text"]]
@@ -129,13 +138,21 @@ def dense_scores(enc, pois, rv, queries, pool="max", emb_cache=None):
     rv["pi"] = rv["business_id"].map(pid)
     rv = rv.sort_values("pi").reset_index(drop=True)
 
-    if emb_cache and os.path.exists(emb_cache):
-        R = np.load(emb_cache)
-        print(f"Pakai cache embedding: {emb_cache}")
-    else:
+    import hashlib
+    fp = hashlib.md5("|".join(rv["review_id"].astype(str)).encode()).hexdigest()
+    fp_path = (emb_cache + ".fp") if emb_cache else None
+    R = None
+    if emb_cache and os.path.exists(emb_cache) and os.path.exists(fp_path):
+        if open(fp_path).read().strip() == fp:
+            R = np.load(emb_cache)
+            print(f"Pakai cache embedding: {emb_cache}")
+        else:
+            print("Cache embedding dibuat untuk set review yang berbeda -> hitung ulang.")
+    if R is None:
         R = np.asarray(enc(rv["text"].tolist(), is_query=False), dtype=np.float32)
         if emb_cache:
             np.save(emb_cache, R)
+            open(fp_path, "w").write(fp)
     Q = np.asarray(enc(list(queries), is_query=True), dtype=np.float32)
     sims = Q @ R.T                                   # [n_query, n_review]
     pi = rv["pi"].to_numpy()
@@ -153,6 +170,26 @@ def dense_scores(enc, pois, rv, queries, pool="max", emb_cache=None):
     return out
 
 
+# ---------- filter metro/state per query ----------
+def metro_mask(qdf, pois):
+    """Boolean [n_query, n_poi]. Kolom 'state' di queries.csv (mis. TN) membatasi kandidat
+    ke state itu; kosong atau 'ALL' = tanpa batas. Semua baseline dapat filter yang SAMA."""
+    n_q, n_p = len(qdf), len(pois)
+    if "state" not in qdf.columns:
+        return np.ones((n_q, n_p), dtype=bool)
+    ps = pois["state"].str.lower().to_numpy()
+    mask = np.ones((n_q, n_p), dtype=bool)
+    for i, v in enumerate(qdf["state"].fillna("").astype(str)):
+        v = v.strip().lower()
+        if v and v != "all":
+            mask[i] = ps == v
+    return mask
+
+
+def apply_mask(S, mask, fill=-1e9):
+    return np.where(mask, S, fill)
+
+
 # ---------- fusi & output ----------
 def rrf(score_mats, k=60):
     fused = np.zeros_like(score_mats[0], dtype=np.float64)
@@ -162,10 +199,13 @@ def rrf(score_mats, k=60):
     return fused
 
 
-def topk_rows(qids, pois, S, method, k):
+def topk_rows(qids, pois, S, method, k, mask=None):
     rows = []
     for qi, qid in enumerate(qids):
-        idx = np.argsort(-S[qi])[:k]
+        order = np.argsort(-S[qi])
+        if mask is not None:  # buang POI di luar metro query, jangan jadi pengisi top-k
+            order = order[mask[qi][order]]
+        idx = order[:k]
         for r, j in enumerate(idx, 1):
             rows.append({"query_id": qid, "method": method, "rank": r,
                          "business_id": pois.iloc[j]["business_id"],
@@ -179,11 +219,11 @@ def build_pool(runs, qdf, pois, pool_k):
         methods=("method", lambda s: "|".join(sorted(set(s)))),
         best_rank=("rank", "min")).reset_index()
     g = g.merge(qdf[["id", "text"]].rename(columns={"id": "query_id", "text": "query"}), on="query_id")
-    g = g.merge(pois[["business_id", "name", "city", "categories"]], on="business_id")
+    g = g.merge(pois[["business_id", "name", "city", "state", "categories"]], on="business_id")
     for c in ("label_a1", "label_a2", "label_a3"):
         g[c] = ""
     return g.sort_values(["query_id", "best_rank"])[
-        ["query_id", "query", "business_id", "name", "city", "categories",
+        ["query_id", "query", "business_id", "name", "city", "state", "categories",
          "methods", "best_rank", "label_a1", "label_a2", "label_a3"]]
 
 
@@ -222,16 +262,18 @@ def main():
     qdf = pd.read_csv(args.queries)
     qids, qtexts = qdf["id"].tolist(), qdf["text"].tolist()
 
-    mats = {"bm25": bm25_scores(pois, rv, qtexts)}
+    mask = metro_mask(qdf, pois)
+    mats = {"bm25": apply_mask(bm25_scores(pois, rv, qtexts), mask)}
     if args.dense.lower() != "none":
         enc = load_encoder(args.dense)
         emb_cache = os.path.join(args.outdir, "review_emb.npy")
-        mats["dense"] = dense_scores(enc, pois, rv, qtexts, pool=args.pool, emb_cache=emb_cache)
+        mats["dense"] = apply_mask(
+            dense_scores(enc, pois, rv, qtexts, pool=args.pool, emb_cache=emb_cache), mask)
         mats["rrf"] = rrf([mats["bm25"], mats["dense"]])
 
     rows = []
     for name, S in mats.items():
-        rows += topk_rows(qids, pois, S, name, args.topk)
+        rows += topk_rows(qids, pois, S, name, args.topk, mask)
     runs = pd.DataFrame(rows)
     runs.to_csv(os.path.join(args.outdir, "runs_text.csv"), index=False)
     pool = build_pool(runs, qdf, pois, args.pool_k)
