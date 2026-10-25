@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+"""
+Baseline teks untuk POI retrieval di Yelp: BM25, dense (embedding review), dan RRF hybrid.
+Output: top-k per query per metode, plus "pool" gabungan untuk annotator.
+
+Persiapan (Kaggle: GPU T4 hanya perlu untuk dense; BM25 jalan di CPU):
+    pip install rank_bm25 sentence-transformers pandas
+
+File query (CSV), kolom wajib id,text ; kolom type opsional:
+    id,text,type
+    P1,"I want to relax while camping near a river with shady forest",mixed
+    ...
+
+Contoh:
+    python baseline_text.py \
+        --business /kaggle/input/.../yelp_academic_dataset_business.json \
+        --reviews  /kaggle/input/.../yelp_academic_dataset_review.json \
+        --cats "Parks,Campgrounds,Beaches" --city Boise --state ID \
+        --queries queries.csv --outdir out_text
+
+    Tanpa --cats = korpus satu kota penuh (semua kategori), lebih realistis untuk query bebas.
+    --dense none           lewati dense (BM25 saja, tanpa GPU)
+    --review-cache f.jsonl simpan subset review supaya run berikutnya tidak baca 5 GB lagi
+
+Catatan desain:
+- BM25 bekerja di level POI (nama + kategori + gabungan review).
+- Dense meng-embed tiap review, lalu skor POI = max (atau top-3 mean) kemiripan antar review POI itu.
+  Ini keputusan "pooling" yang bisa lu jadikan baris ablasi.
+- Atribut Yelp (Ambience, NoiseLevel, dst.) SENGAJA tidak dipakai di sini, supaya bisa
+  dipakai sebagai ground truth otomatis nanti.
+"""
 import argparse
 import os
 import re
@@ -28,7 +58,8 @@ def select_pois(business_path, cats, city, state, min_reviews):
     df["categories"] = df["categories"].fillna("")
     df["review_count"] = pd.to_numeric(df["review_count"], errors="coerce").fillna(0).astype(int)
     wanted = {c.strip().lower() for c in cats if c.strip()}
-    df = df[df["categories"].map(lambda s: any(c.strip().lower() in wanted for c in s.split(",")))]
+    if wanted:  # tanpa --cats: semua kategori (korpus satu kota penuh)
+        df = df[df["categories"].map(lambda s: any(c.strip().lower() in wanted for c in s.split(",")))]
     if city:
         df = df[df["city"].str.lower() == city.lower()]
     if state:
@@ -160,8 +191,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--business", required=True)
     ap.add_argument("--reviews", help="review.json (atau file cache dari --review-cache)")
-    ap.add_argument("--cats", required=True)
-    ap.add_argument("--city")
+    ap.add_argument("--cats", default="",
+                    help="filter kategori (pisah koma). Kosongkan = semua kategori di kota itu")
+    ap.add_argument("--city", nargs="+", help="nama kota; boleh lebih dari satu kata, mis. --city New Orleans")
     ap.add_argument("--state")
     ap.add_argument("--min-reviews", type=int, default=10)
     ap.add_argument("--max-reviews-per-poi", type=int, default=100)
@@ -174,9 +206,10 @@ def main():
     ap.add_argument("--review-cache")
     ap.add_argument("--outdir", default="out_text")
     args = ap.parse_args()
+    args.city = " ".join(args.city) if args.city else None
     os.makedirs(args.outdir, exist_ok=True)
 
-    cats = [c.strip() for c in args.cats.split(",")]
+    cats = [c.strip() for c in args.cats.split(",") if c.strip()]
     pois = select_pois(args.business, cats, args.city, args.state, args.min_reviews)
     if pois.empty:
         sys.exit("Tidak ada POI yang cocok. Cek --cats/--city/--state.")
